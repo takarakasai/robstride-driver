@@ -1,0 +1,15 @@
+[package]
+name = "robstride-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Driver for the Robstride CAN servo motor family (RS-00..RS-06 / Edulite series) over Linux SocketCAN"
+
+[dependencies]
+robstride-protocol = { workspace = true }
+socketcan = { workspace = true }
+embedded-can = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
