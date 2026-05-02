@@ -100,9 +100,12 @@ impl Motor {
         Ok(())
     }
 
-    /// Receive the next frame addressed to us, dropping echoes and frames for
-    /// other motors.
-    fn recv(&self) -> Result<(u8, u16, u8, Vec<u8>)> {
+    /// Receive frames until one matches `accept`, dropping unmatched frames.
+    /// Returns timeout error if no accepted frame arrives within `self.timeout`.
+    fn recv_filtered<F>(&self, mut accept: F) -> Result<(u8, u16, u8, Vec<u8>)>
+    where
+        F: FnMut(u8, u16, u8) -> bool,
+    {
         let start = Instant::now();
         loop {
             if start.elapsed() > self.timeout {
@@ -126,7 +129,10 @@ impl Motor {
                         "RX id=0x{:08X} comm={} extra=0x{:04X} dev={} data={:02X?}",
                         raw_id, comm_type, extra_data, device_id, &data,
                     );
-                    return Ok((comm_type, extra_data, device_id, data));
+                    if accept(comm_type, extra_data, device_id) {
+                        return Ok((comm_type, extra_data, device_id, data));
+                    }
+                    // Otherwise drop and keep waiting.
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(Error::CanSocket(e)),
@@ -134,20 +140,21 @@ impl Motor {
         }
     }
 
+    /// Backwards-compatible: receive the next frame regardless of type.
+    fn recv(&self) -> Result<(u8, u16, u8, Vec<u8>)> {
+        self.recv_filtered(|_, _, _| true)
+    }
+
     fn recv_status(&self) -> Result<MotorFeedback> {
-        let (comm_type, extra_data, device_id, data) = self.recv()?;
+        let (comm_type, extra_data, device_id, data) = self.recv_filtered(|ct, _, _| {
+            ct == CommType::OperationStatus as u8 || ct == CommType::FaultReport as u8
+        })?;
 
         if comm_type == CommType::FaultReport as u8 {
             return Err(Error::MotorFault {
                 motor_id: device_id,
                 extra_data,
             });
-        }
-        if comm_type != CommType::OperationStatus as u8 {
-            return Err(Error::InvalidResponse(format!(
-                "expected OperationStatus (type=2), got type={} from device={}",
-                comm_type, device_id
-            )));
         }
 
         parse_status_frame(
@@ -267,10 +274,29 @@ impl Motor {
     pub fn read_param(&self, param: ParamIndex) -> Result<f32> {
         let (id, data) = build_read_param_frame(self.host_id, self.motor_id, param);
         self.send(id, &data)?;
-        let (_ct, _extra, _dev, payload) = self.recv()?;
-        let (_idx, val) = parse_param_response(&payload)
-            .ok_or_else(|| Error::InvalidResponse("failed to parse param response".into()))?;
-        Ok(val)
+        let target_idx = param as u16;
+        // Drain ReadParameter responses for other indices (left over from
+        // overlapping reads or buffered ACKs) until we get the one we asked for.
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > self.timeout {
+                return Err(Error::Timeout {
+                    motor_id: self.motor_id,
+                });
+            }
+            let (_ct, _extra, _dev, payload) = self.recv_filtered(|ct, _, _| {
+                ct == CommType::ReadParameter as u8
+            })?;
+            let (idx, val) = parse_param_response(&payload)
+                .ok_or_else(|| Error::InvalidResponse("failed to parse param response".into()))?;
+            if idx == target_idx {
+                return Ok(val);
+            }
+            log::debug!(
+                "read_param: discarding stale response idx=0x{:04X} (wanted 0x{:04X})",
+                idx, target_idx
+            );
+        }
     }
 
     pub fn write_param_f32(&self, param: ParamIndex, value: f32) -> Result<()> {
@@ -306,6 +332,21 @@ impl Motor {
 
     pub fn read_vbus(&self) -> Result<f32> {
         self.read_param(ParamIndex::Vbus)
+    }
+
+    /// Read filtered measured torque (Nm) via parameter access. Safe to call
+    /// in any run mode — does not send a control frame.
+    pub fn read_torque(&self) -> Result<f32> {
+        self.read_param(ParamIndex::MeasuredTorque)
+    }
+
+    /// Read motor temperature (°C). The protocol exposes temperature only via
+    /// the status frame, so this calls [`Self::read_status`] internally — that
+    /// sends a zero-amplitude MIT control frame, which can disrupt non-MIT
+    /// run modes. Avoid calling while actively position/velocity/torque
+    /// controlling; use it for one-shot snapshots when the motor is idle.
+    pub fn read_temperature(&self) -> Result<f32> {
+        Ok(self.read_status()?.temperature)
     }
 }
 
