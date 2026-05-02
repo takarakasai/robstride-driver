@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Driver for the Robstride CAN servo motor family (RS-00..RS-06 / Edulite series) over Linux SocketCAN"
+description = "Rust SocketCAN driver for Robstride RS-series servo motors (RS-00..06 + Edulite01/02/05)"
 
 [dependencies]
 robstride-protocol = { workspace = true }
